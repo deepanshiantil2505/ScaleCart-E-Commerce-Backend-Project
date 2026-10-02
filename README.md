@@ -42,39 +42,39 @@ Built with **Java 21** and **Spring Boot 3.3**, ScaleCart strictly adheres to **
 
 ```mermaid
 flowchart TD
-    Client(["🌐 Client / Web / Mobile"]) -->|HTTP / REST (JWT)| ALB["AWS Application Load Balancer"]
-    ALB --> Gateway["Spring Security Filter Chain<br/>(Stateless JWT & RBAC)"]
+    Client["Client (Web / Mobile)"] -->|"HTTPS / REST (JWT)"| ALB["AWS Application Load Balancer"]
+    ALB --> Gateway["Spring Security Filter Chain (JWT & RBAC)"]
 
-    subgraph ScaleCart Application Core
-        Gateway --> AuthSvc["Authentication Service<br/>(BCrypt / Token Issuance)"]
-        Gateway --> ProductSvc["Product Service<br/>(Cache-Aside)"]
-        Gateway --> OrderSvc["Order Service<br/>(Saga / State Transitions)"]
-        Gateway --> InventorySvc["Inventory Service<br/>(Pessimistic Locking)"]
-        Gateway --> PaymentSvc["Mock Payment Service<br/>(Idempotency Support)"]
+    subgraph Core ["ScaleCart Application Core"]
+        Gateway --> AuthSvc["Authentication Service"]
+        Gateway --> ProductSvc["Product Service"]
+        Gateway --> OrderSvc["Order Service"]
+        Gateway --> InventorySvc["Inventory Service"]
+        Gateway --> PaymentSvc["Mock Payment Service"]
 
-        OrderSvc -->|Pessimistic Lock & Reserve| InventorySvc
-        PaymentSvc -->|Confirm Sale| InventorySvc
-        PaymentSvc -->|Update Status| OrderSvc
-        ProductSvc -->|Get Stock| InventorySvc
+        OrderSvc -->|"Pessimistic Lock & Reserve"| InventorySvc
+        PaymentSvc -->|"Confirm Sale"| InventorySvc
+        PaymentSvc -->|"Update Status"| OrderSvc
+        ProductSvc -->|"Get Stock"| InventorySvc
     end
 
-    subgraph Data & Caching Tier
-        ProductSvc <-->|Cache Hit / Miss| Redis[("⚡ Redis Cache<br/>(10m TTL / JSON)")]
-        AuthSvc <--> DB[("🗄️ PostgreSQL 16<br/>(Users, Orders, Inventory, Payments)")]
-        ProductSvc <--> DB
-        OrderSvc <--> DB
-        InventorySvc <-->|SELECT ... FOR UPDATE| DB
-        PaymentSvc <--> DB
+    subgraph Storage ["Data & Caching Tier"]
+        ProductSvc -->|"Cache Read / Write"| Redis["Redis 7 Cache (TTL 10m)"]
+        AuthSvc --> DB["PostgreSQL 16 Database"]
+        ProductSvc --> DB
+        OrderSvc --> DB
+        InventorySvc -->|"SELECT ... FOR UPDATE"| DB
+        PaymentSvc --> DB
     end
 
-    subgraph Event-Driven Messaging (Apache Kafka)
-        OrderSvc -->|Publish OrderCreatedEvent| KafkaBrokers["📩 Apache Kafka Broker"]
-        PaymentSvc -->|Publish PaymentProcessedEvent| KafkaBrokers
-        InventorySvc -->|Publish InventoryUpdatedEvent| KafkaBrokers
+    subgraph Messaging ["Event-Driven Messaging"]
+        OrderSvc -->|"Publish OrderCreated"| Kafka["Apache Kafka Broker"]
+        PaymentSvc -->|"Publish PaymentProcessed"| Kafka
+        InventorySvc -->|"Publish InventoryUpdated"| Kafka
 
-        KafkaBrokers --> Consumer1["Inventory Consumer Group"]
-        KafkaBrokers --> Consumer2["Notification / Shipping Consumer"]
-        KafkaBrokers --> Consumer3["Analytics Consumer"]
+        Kafka --> Consumer1["Inventory Consumer Group"]
+        Kafka --> Consumer2["Notification & Shipping Group"]
+        Kafka --> Consumer3["Analytics Consumer Group"]
     end
 ```
 
@@ -90,7 +90,7 @@ sequenceDiagram
     participant Cache as Redis Cache
     participant DB as PostgreSQL
     participant Kafka as Apache Kafka
-    participant Pay as Payment Gateway (Mock)
+    participant Pay as Mock Payment Gateway
 
     Customer->>API: POST /api/v1/auth/login
     API->>DB: Validate credentials & BCrypt hash
@@ -108,38 +108,37 @@ sequenceDiagram
     API-->>Customer: Product details + Available Stock
 
     Customer->>API: POST /api/v1/orders (productId=1, qty=1)
-    critical Concurrency-Safe Stock Reservation
-        API->>DB: SELECT * FROM inventories WHERE product_id=1 FOR UPDATE
-        Note over API,DB: Row-level lock acquired. Competing requests block.
-        API->>DB: availableStock -= 1, reservedStock += 1
-        API->>DB: Save Order (Status: PENDING)
-    end
+    Note over API,DB: Concurrency-Safe Stock Reservation
+    API->>DB: SELECT * FROM inventories WHERE product_id=1 FOR UPDATE
+    API->>DB: Deduct available stock & increment reserved stock
+    API->>DB: Save Order (Status: PENDING)
     API->>Kafka: Publish OrderCreatedEvent
     API-->>Customer: Order Created (Status: PENDING)
 
     Customer->>API: POST /api/v1/payments/process (orderId, idempotencyKey)
     API->>Pay: Process Mock Payment
     Pay-->>API: Payment SUCCESS (Transaction ID)
-    API->>DB: Update Order Status -> CONFIRMED
-    API->>DB: Inventory reservedStock -= 1, soldStock += 1
+    API->>DB: Update Order Status to CONFIRMED
+    API->>DB: Move stock from reserved to sold
     API->>Kafka: Publish PaymentProcessedEvent
     API-->>Customer: Payment Successful & Order Confirmed
 ```
 
 ---
 
-## 💡 Real-World Technical Deep Dives (Interview Highlights)
+## 💡 Technical Architecture Deep Dives
 
-### 1. The High-Concurrency Inventory Problem: Preventing Overselling
+### 1. High-Concurrency Stock Reservation: Preventing Race Conditions and Overselling
 
-> **The Question**: *"What happens if two users try to buy the last available product at almost the same time?"*
+> **Scenario**: Two users attempt to buy the last remaining unit of an item (`availableStock = 1`) at the exact same millisecond.
 
-In a naive implementation:
+#### The Problem:
+In standard unsynchronized systems:
 1. Thread A queries database: `availableStock = 1`.
-2. Thread B queries database simultaneously: `availableStock = 1`.
+2. Thread B queries database concurrently: `availableStock = 1`.
 3. Thread A checks `1 >= 1` (OK), updates `availableStock = 0`.
 4. Thread B checks `1 >= 1` (OK), updates `availableStock = -1` (or 0).
-5. **Outcome**: Both orders succeed, but the merchant only had 1 unit in stock. **This is a race condition leading to overselling.**
+5. **Outcome**: Both orders succeed, but the merchant only had 1 unit in physical stock. **This is a classic race condition resulting in overselling.**
 
 #### The ScaleCart Solution:
 ScaleCart implements **Pessimistic Write Locking** at the database engine level via JPA:
@@ -160,9 +159,9 @@ Optional<Inventory> findByProductIdWithLock(@Param("productId") Long productId);
   ```java
   throw new InsufficientStockException("Insufficient stock for product ID: ...");
   ```
-- **Outcome**: Exactly 1 order succeeds, 1 order receives HTTP 409 Conflict. Zero race conditions. Zero negative stock.
+- **Outcome**: Exactly 1 order succeeds, and competing requests receive an `HTTP 409 Conflict`. Zero race conditions. Zero negative stock.
 
-> **Automated Verification**: See [`InventoryConcurrencyTest.java`](src/test/java/com/scalecart/inventory/InventoryConcurrencyTest.java) where an `ExecutorService` launches concurrent threads simultaneously firing at stock=1. The test asserts that exactly 1 succeeds and 1 fails.
+> **Automated Verification**: See [`InventoryConcurrencyTest.java`](src/test/java/com/scalecart/inventory/InventoryConcurrencyTest.java) where an `ExecutorService` launches concurrent threads simultaneously firing at `stock = 1`. The test asserts that exactly 1 succeeds and 1 fails.
 
 ---
 
@@ -213,8 +212,8 @@ ScaleCart includes an in-memory profile with embedded H2 database, in-memory cac
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/scalecart.git
-cd scalecart
+git clone https://github.com/deepanshiantil2505/ScaleCart-E-Commerce-Backend-Project.git
+cd ScaleCart-E-Commerce-Backend-Project
 
 # Run unit and concurrency tests
 ./mvnw clean test
